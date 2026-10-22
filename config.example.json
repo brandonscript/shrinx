@@ -18,21 +18,27 @@
     "png": {
       "enabled": true,
       "mode": "lossy",
-      "quality": 95
+      "quality": 95,
+      "relative": false
     },
     "jpeg": {
       "enabled": true,
       "mode": "lossy",
-      "quality": 80
+      "quality": 80,
+      "relative": false
     },
     "tiff": {
       "enabled": true,
-      "mode": "lossless"
+      "mode": "lossless",
+      "relative": false
     },
     "bmp": {
       "enabled": false,
-      "mode": "lossless"
+      "mode": "lossless",
+      "relative": false
     }
   },
-  "metadata_policy": "skip"
+  "metadata_policy": "skip",
+  "map_iptc_to_xmp": false,
+  "metadata_exemptions": []
 }

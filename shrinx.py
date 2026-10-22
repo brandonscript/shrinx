@@ -6,7 +6,9 @@ import fcntl
 import hashlib
 import json
 import logging
+import math
 import os
+from fractions import Fraction
 from pathlib import Path
 import plistlib
 import shutil
@@ -15,6 +17,10 @@ import subprocess
 import sys
 import tempfile
 import time
+import zlib
+import re
+from png_colors import color_plan, prepare_png, has_embedded_icc
+from metadata import IPTC_MAP, BOILERPLATE, photoshop_resources, map_iptc
 
 ROOT = Path(__file__).resolve().parent
 LABEL = 'dev.shrinx.screenshots'
@@ -43,17 +49,25 @@ def load_config(path):
         raise ValueError('reports_directory must be a nonempty path')
     if cfg.get('metadata_policy', 'skip') not in ('skip', 'discard'):
         raise ValueError('metadata_policy must be skip or discard')
+    if not isinstance(cfg.get('map_iptc_to_xmp', False), bool):
+        raise ValueError('map_iptc_to_xmp must be true or false')
+    exemptions = cfg.get('metadata_exemptions', [])
+    allowed = {'jpeg:photoshop', 'jpeg:adobe', 'jpeg:comment', 'png:oiio-colorspace'} | {'iptc:' + name for name in set(IPTC_MAP) | BOILERPLATE | {'DateCreated', 'TimeCreated'}}
+    if not isinstance(exemptions, list) or any(not isinstance(e, str) or (e not in allowed and not re.fullmatch(r'(?:jpeg:photoshop:0x[0-9a-f]{4}|iptc:[A-Za-z][A-Za-z0-9-]*)', e)) for e in exemptions):
+        raise ValueError('Invalid metadata_exemptions entry')
     file_types = cfg.get('file_types', list(TYPE_EXTENSIONS))
     if not isinstance(file_types, (list, dict)) or any(not isinstance(t, str) or t not in TYPE_EXTENSIONS for t in file_types):
         raise ValueError('file_types must contain only png, jpeg, tiff, and/or bmp')
     if isinstance(file_types, dict):
         for kind, settings in file_types.items():
-            if not isinstance(settings, dict) or set(settings) - {'enabled', 'mode', 'quality'}:
+            if not isinstance(settings, dict) or set(settings) - {'enabled', 'mode', 'quality', 'relative'}:
                 raise ValueError(f'invalid settings for {kind}')
             if not isinstance(settings.get('enabled', True), bool):
                 raise ValueError(f'{kind}.enabled must be true or false')
             if settings.get('mode', cfg['mode']) not in ('auto', 'lossy', 'lossless'):
                 raise ValueError(f'invalid mode for {kind}')
+            if not isinstance(settings.get('relative', False), bool):
+                raise ValueError(f'{kind}.relative must be true or false')
             quality = settings.get('quality', cfg['quality'])
             if isinstance(quality, bool) or not isinstance(quality, (int, float)) or not 0 <= quality <= 100:
                 raise ValueError(f'invalid quality for {kind}')
@@ -167,17 +181,124 @@ def image_supported(path):
     return False
 
 
-def unsupported_metadata(path):
+def png_xmp(data):
+    keyword, body = data.split(b'\0', 1)
+    if keyword != b'XML:com.adobe.xmp' or len(body) < 4 or body[0] not in (0, 1) or body[1] != 0:
+        raise ValueError('Unsupported PNG text metadata')
+    language, translated, text = body[2:].split(b'\0', 2)
+    if language or translated:
+        raise ValueError('PNG XMP language/translated keyword would be lost')
+    return zlib.decompress(text) if body[0] else text
+
+
+def verify_png_metadata(source, output):
+    """Require byte-exact EXIF, ICC and XMP payloads before any translation."""
+    expected = {}
+    with source.open('rb') as f:
+        f.seek(8)
+        while header := f.read(8):
+            if len(header) != 8:
+                raise ValueError('Truncated PNG chunk')
+            size, kind = struct.unpack('>I4s', header)
+            if kind not in (b'eXIf', b'iCCP', b'iTXt'):
+                f.seek(size + 4, 1)
+                if kind == b'IEND':
+                    break
+                continue
+            data = f.read(size)
+            f.read(4)
+            if kind == b'eXIf':
+                tag, payload = b'EXIF', data
+            elif kind == b'iCCP':
+                name, body = data.split(b'\0', 1)
+                if not body or body[0] != 0:
+                    raise ValueError('Unsupported ICC compression')
+                tag, payload = b'ICCP', zlib.decompress(body[1:])
+            else:
+                tag, payload = b'XMP ', png_xmp(data)
+            if tag in expected:
+                raise ValueError('Duplicate PNG metadata payload')
+            expected[tag] = payload
+    actual = {}
+    with output.open('rb') as f:
+        header = f.read(12)
+        if header[:4] != b'RIFF' or header[8:] != b'WEBP':
+            raise ValueError('Invalid encoded WebP')
+        while header := f.read(8):
+            if len(header) != 8:
+                raise ValueError('Truncated WebP chunk')
+            tag, size = struct.unpack('<4sI', header)
+            if tag in expected:
+                if tag in actual:
+                    raise ValueError('Duplicate WebP metadata payload')
+                actual[tag] = f.read(size)
+                f.seek(size % 2, 1)
+            else:
+                f.seek(size + size % 2, 1)
+    if any(actual.get(tag) != payload for tag, payload in expected.items()):
+        raise ValueError('PNG metadata did not survive WebP encoding unchanged')
+
+
+def unsupported_metadata(path, cfg=None):
+    cfg = cfg or {}
+    exemptions = cfg.get('metadata_exemptions', [])
     """Conservative check for metadata the current conversion path cannot retain."""
     extension = path.suffix.lower()
     with path.open('rb') as f:
         if extension == '.png':
+            try:
+                handled_colors, profile = color_plan(path)
+            except (OSError, ValueError, zlib.error, IndexError):
+                return 'unsupported or conflicting PNG color metadata'
             f.seek(8)
             while True:
                 header = f.read(8)
                 if len(header) != 8:
                     return 'unreadable PNG chunks'
                 size, kind = struct.unpack('>I4s', header)
+                if kind in handled_colors:
+                    f.seek(size + 4, 1)
+                    continue
+                if kind == b'oFFs':
+                    data = f.read(size)
+                    if data != bytes(9):
+                        return 'nonzero PNG image offset'
+                    f.seek(4, 1)
+                    continue
+                if kind == b'tEXt' and 'png:oiio-colorspace' in exemptions:
+                    if size > path.stat().st_size:
+                        return 'invalid PNG text size'
+                    data = f.read(size)
+                    if data.split(b'\0', 1)[0] != b'oiio:ColorSpace' or b'\0' not in data:
+                        return 'unexempted PNG text metadata'
+                    if not has_embedded_icc(path):
+                        return 'advisory color exemption requires embedded ICC profile'
+                    LOG.info('Exempting advisory oiio:ColorSpace label; retaining embedded ICC profile: %s', path)
+                    f.seek(4, 1)
+                    continue
+                if kind == b'iTXt':
+                    if size > path.stat().st_size:
+                        return 'invalid PNG text size'
+                    try:
+                        png_xmp(f.read(size))
+                    except (ValueError, zlib.error):
+                        return 'unsupported PNG text metadata'
+                    f.seek(4, 1)
+                    continue
+                if kind == b'iDOT':
+                    if size != 28:
+                        return 'unknown Apple PNG offset layout'
+                    # PNG byte offsets are encoding bookkeeping, not portable metadata.
+                    f.seek(size + 4, 1)
+                    continue
+                if kind == b'pHYs':
+                    if size != 9 or not shutil.which('exiftool'):
+                        return 'PNG resolution requires ExifTool'
+                    data = f.read(size)
+                    if len(data) != 9 or data[8] not in (0, 1) or 0 in struct.unpack('>II', data[:8]):
+                        return 'unsupported PNG resolution'
+                    f.seek(4, 1)
+                    continue
                 if kind not in (b'IHDR', b'PLTE', b'IDAT', b'IEND', b'tRNS', b'iCCP', b'eXIf'):
                     return 'PNG chunk ' + kind.decode('ascii', errors='replace')
                 if kind == b'IEND':
@@ -210,16 +331,39 @@ def unsupported_metadata(path):
                 if size < 2 or position + size > len(data):
                     return 'invalid JPEG segment size'
                 if marker == 0xE0:
-                    # Default JFIF density with no thumbnail is a structural header.
                     if (len(payload) != 14 or not payload.startswith(b'JFIF\0')
-                            or payload[7:14] != b'\0\0\1\0\1\0\0'):
-                        return 'JPEG JFIF density/thumbnail or unknown APP0'
+                            or payload[7] not in (0, 1, 2) or payload[12:14] != b'\0\0'):
+                        return 'JPEG thumbnail or unknown APP0'
+                    if payload[7:14] != b'\0\0\1\0\1\0\0' and not shutil.which('exiftool'):
+                        return 'JPEG density requires ExifTool'
+                    if 0 in struct.unpack('>HH', payload[8:12]):
+                        LOG.info('Ignoring unusable zero JPEG density: %s', path)
                 elif marker == 0xE1:
                     if not payload.startswith((b'Exif\0\0', b'http://ns.adobe.com/xap/1.0/\0')):
                         return 'unknown JPEG APP1'
                 elif marker == 0xE2:
                     if not payload.startswith(b'ICC_PROFILE\0'):
                         return 'unknown JPEG APP2'
+                elif marker == 0xED:
+                    if 'jpeg:photoshop' in exemptions:
+                        LOG.info('Exempting Photoshop APP13 metadata: %s', path)
+                    else:
+                        try:
+                            resources = photoshop_resources(payload)
+                        except ValueError:
+                            return 'unrecognized Photoshop resource layout'
+                        for resource in resources:
+                            key = f'jpeg:photoshop:0x{resource:04x}'
+                            if key in exemptions:
+                                LOG.info('Exempting %s: %s', key, path)
+                            elif resource in (0x0404, 0x0425) and cfg.get('map_iptc_to_xmp') and shutil.which('exiftool'):
+                                continue
+                            else:
+                                return 'unmapped Photoshop resource ' + key
+                elif marker == 0xEE and 'jpeg:adobe' in exemptions:
+                    LOG.info('Exempting Adobe APP14 metadata: %s', path)
+                elif marker == 0xFE and 'jpeg:comment' in exemptions:
+                    LOG.info('Exempting JPEG comment: %s', path)
                 elif 0xE3 <= marker <= 0xEF or marker == 0xFE:
                     return 'JPEG APP/comment metadata'
                 position += size
@@ -254,6 +398,96 @@ def unsupported_metadata(path):
     return None
 
 
+def density_mapping(path):
+    """Map physical density/aspect ratio to standard EXIF rationals and units."""
+    with path.open('rb') as f:
+        if path.suffix.lower() == '.png':
+            f.seek(8)
+            while header := f.read(8):
+                if len(header) != 8:
+                    break
+                size, kind = struct.unpack('>I4s', header)
+                if kind == b'pHYs' and size == 9:
+                    data = f.read(9)
+                    x, y, unit = struct.unpack('>IIB', data)
+                    if unit == 1 and x and y:
+                        return (Fraction(x, 100), Fraction(y, 100), 3)
+                    if unit == 0 and x and y:
+                        return (Fraction(x), Fraction(y), 1)
+                    return None
+                f.seek(size + 4, 1)
+                if kind == b'IEND':
+                    break
+        elif path.suffix.lower() in JPEG_EXTENSIONS:
+            data = f.read()
+            position = 2
+            while position + 4 <= len(data) and data[position] == 255:
+                marker = data[position + 1]
+                if marker == 0xDA:
+                    break
+                size = int.from_bytes(data[position + 2:position + 4], 'big')
+                if size < 2:
+                    break
+                payload = data[position + 4:position + 2 + size]
+                if marker == 0xE0 and len(payload) == 14 and payload.startswith(b'JFIF\0'):
+                    unit = payload[7]
+                    x, y = struct.unpack('>HH', payload[8:12])
+                    if payload[7:14] == b'\0\0\1\0\1\0\0':
+                        return None
+                    if unit in (0, 1, 2) and x and y:
+                        return Fraction(x), Fraction(y), {0: 1, 1: 2, 2: 3}[unit]
+                position += 2 + size
+    return None
+
+
+def transfer_density(source, output, mapping):
+    """Verify native metadata, translate density, then verify semantic preservation."""
+    tool = shutil.which('exiftool')
+    if not tool:
+        raise ValueError('ExifTool is required to transfer resolution metadata')
+
+    def binary(tag, path):
+        return subprocess.check_output([tool, '-b', '-' + tag, str(path)], timeout=60)
+
+    def exif(path):
+        data = json.loads(subprocess.check_output(
+            [tool, '-j', '-n', '-s', '-G1', '-EXIF:all', str(path)], timeout=60))[0]
+        data.pop('SourceFile', None)
+        return data
+
+    original_exif = exif(source)
+    # All metadata cwebp claims to copy must arrive unchanged before translation.
+    preserved = {}
+    for tag in ('EXIF', 'ICC_Profile', 'XMP'):
+        raw = binary(tag, source)
+        encoded = binary(tag, output)
+        if raw and encoded != raw:
+            raise ValueError(f'{tag} did not survive encoding unchanged')
+        preserved[tag] = encoded
+    x, y, unit = mapping
+    destination = exif(output)
+    # Source-format density wins over redundant/conflicting EXIF density.
+    for name, expected in (('XResolution', float(x)), ('YResolution', float(y)), ('ResolutionUnit', unit)):
+        values = [value for key, value in destination.items() if key.endswith(':' + name)]
+        if any(value != expected for value in values):
+            LOG.info('Using source-format %s=%s instead of EXIF values %s: %s', name, expected, values, source)
+    subprocess.run([tool, '-overwrite_original', '-EXIF:XResolution=' + str(x),
+                    '-EXIF:YResolution=' + str(y), '-EXIF:ResolutionUnit#=' + str(unit),
+                    str(output)], check=True, capture_output=True, timeout=60)
+    updated = exif(output)
+    density_fields = {'IFD0:XResolution', 'IFD0:YResolution', 'IFD0:ResolutionUnit'}
+    if any(updated.get(key) != value for key, value in original_exif.items() if key not in density_fields):
+        raise ValueError('Existing EXIF fields changed during density transfer')
+    for name, expected in (('XResolution', float(x)), ('YResolution', float(y)), ('ResolutionUnit', unit)):
+        if not any(key.endswith(':' + name) and abs(value - expected) < 1e-7
+                   for key, value in updated.items() if isinstance(value, (int, float))):
+            raise ValueError('Resolution transfer verification failed: ' + name)
+    for tag in ('ICC_Profile', 'XMP'):
+        if preserved[tag] and binary(tag, output) != preserved[tag]:
+            raise ValueError(tag + ' changed during density transfer')
+    LOG.info('Verified density transfer into EXIF: %s', source)
+
+
 def signature(path):
     s = path.stat()
     return (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns)
@@ -283,10 +517,26 @@ def trash(path):
 def type_settings(cfg, kind):
     types = cfg.get('file_types', list(TYPE_EXTENSIONS))
     if isinstance(types, list):
-        return dict(enabled=kind in types, mode=cfg['mode'], quality=cfg['quality'])
+        return dict(enabled=kind in types, mode=cfg['mode'], quality=cfg['quality'], relative=False)
     options = types.get(kind, {})
     return dict(enabled=kind in types and options.get('enabled', True),
-                mode=options.get('mode', cfg['mode']), quality=options.get('quality', cfg['quality']))
+                mode=options.get('mode', cfg['mode']), quality=options.get('quality', cfg['quality']), relative=options.get('relative', False))
+
+
+def relative_candidate(encode, quality, target_bytes):
+    """Bounded search for the highest tested integer quality that meets the target."""
+    if target_bytes <= 0:
+        return None
+    low, high, best = 0, max(0, math.ceil(quality) - 1), None
+    while low <= high:
+        q = (low + high) // 2
+        output = encode(q)
+        if output.stat().st_size <= target_bytes:
+            best = output
+            low = q + 1
+        else:
+            high = q - 1
+    return best
 
 
 def convert(path, cfg, encoder, dry_run=False, metrics=None):
@@ -312,7 +562,7 @@ def convert(path, cfg, encoder, dry_run=False, metrics=None):
         LOG.info('Skipped unsupported image (unsupported format variant or invalid file): %s', path)
         return 'skipped'
     if cfg.get('metadata_policy', 'skip') == 'skip':
-        reason = unsupported_metadata(path)
+        reason = unsupported_metadata(path, cfg)
         if reason:
             LOG.info('Keeping original because metadata may be lost (%s): %s', reason, path)
             return 'skipped'
@@ -328,13 +578,38 @@ def convert(path, cfg, encoder, dry_run=False, metrics=None):
                            check=True, capture_output=True, timeout=180)
             if not png_supported(input_path):
                 raise ValueError('BMP conversion did not produce a supported PNG')
+        if kind == 'png' and cfg.get('metadata_policy', 'skip') == 'skip':
+            input_path = prepare_png(path, Path(folder) / 'normalized.png', color_plan(path))
         modes = ('lossless', 'lossy') if cfg['mode'] == 'auto' else (cfg['mode'],)
+        mapping = density_mapping(path)
+        if cfg.get('metadata_policy', 'skip') == 'discard' and not shutil.which('exiftool'):
+            mapping = None
         candidates = []
-        for mode in modes:
-            output = Path(folder) / f'{mode}.webp'
-            flags = ['-lossless', '-exact'] if mode == 'lossless' else ['-q', str(cfg['quality']), '-alpha_q', '100', '-sharp_yuv']
+        def encode(mode, quality, label):
+            output = Path(folder) / f'{label}.webp'
+            flags = ['-lossless', '-exact'] if mode == 'lossless' else ['-q', str(quality), '-alpha_q', '100', '-sharp_yuv']
             subprocess.run([encoder, '-quiet', '-m', '6', '-metadata', 'all', *flags, str(input_path), '-o', str(output)], check=True, capture_output=True, timeout=180)
+            if kind == 'png' and cfg.get('metadata_policy', 'skip') == 'skip':
+                verify_png_metadata(input_path, output)
+            if mapping:
+                transfer_density(path, output, mapping)
+            if kind == 'jpeg' and cfg.get('map_iptc_to_xmp') and not {'jpeg:photoshop', 'jpeg:photoshop:0x0404'}.intersection(cfg.get('metadata_exemptions', [])):
+                map_iptc(path, output, cfg.get('metadata_exemptions', []))
             candidates.append(output)
+            return output
+        for mode in modes:
+            encode(mode, cfg['quality'], mode)
+        initial = min(candidates, key=lambda p: p.stat().st_size)
+        if settings['relative'] and cfg['mode'] != 'lossless' and initial.stat().st_size >= before[2]:
+            target_bytes = min(int(before[2] * cfg['quality'] / 100), before[2] - 1)
+            best = relative_candidate(lambda q: encode('lossy', q, f'lossy-q{q}'), cfg['quality'], target_bytes)
+            if best is None:
+                LOG.info('Relative size target unattainable; keeping original: %s', path)
+                return 'skipped'
+            # Only target-compliant trials may be selected or adopted for cleanup.
+            candidates = [best]
+            LOG.info('Relative mode: target %d bytes (%.1f%% of original); selected %s at %d bytes: %s',
+                     target_bytes, cfg['quality'], best.stem, best.stat().st_size, path)
         if existing:
             target_hash = digest(target)
             matches = [p for p in candidates if digest(p) == target_hash]
@@ -460,7 +735,7 @@ def run(cfg, config_path, dry_run):
                     scanned += 1
                     try:
                         counts[convert(path, cfg, encoder, dry_run, metrics)] += 1
-                    except (ValueError, OSError, subprocess.SubprocessError) as e:
+                    except (ValueError, zlib.error, OSError, subprocess.SubprocessError) as e:
                         LOG.error('Failed %s: %s %s', path, e, getattr(e, 'stderr', b''))
                         counts['failed'] += 1
             except OSError as e:
@@ -510,7 +785,7 @@ def main():
             return run(cfg, args.config, args.dry_run)
         agent(cfg, args.config, args.action)
         return 0
-    except (ValueError, OSError, subprocess.SubprocessError) as e:
+    except (ValueError, zlib.error, OSError, subprocess.SubprocessError) as e:
         LOG.error('%s', e)
         return 1
 
