@@ -23,6 +23,7 @@ from png_colors import color_plan, prepare_png, has_embedded_icc
 from metadata import IPTC_MAP, BOILERPLATE, photoshop_resources, map_iptc
 
 ROOT = Path(__file__).resolve().parent
+VERSION = '0.1.0'
 LABEL = 'dev.shrinx.screenshots'
 LOG = logging.getLogger('shrinx')
 JPEG_EXTENSIONS = {'.jpg', '.jpeg', '.jpe', '.jfif', '.jif', '.jfi'}
@@ -756,7 +757,7 @@ def agent(cfg, config_path, action):
     logs = Path.home() / 'Library/Logs/Shrinx'
     logs.mkdir(parents=True, exist_ok=True)
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = dict(Label=LABEL, ProgramArguments=[sys.executable, str(ROOT / 'shrinx.py'), '--config', str(config_path.resolve()), 'run'], ProcessType='Background', LowPriorityIO=True, Nice=10, StandardOutPath=str(logs / 'service.log'), StandardErrorPath=str(logs / 'error.log'), EnvironmentVariables={'PATH': '/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin'})
+    payload = dict(Label=LABEL, ProgramArguments=[os.environ.get('SHRINX_PYTHON', sys.executable), os.environ.get('SHRINX_SCRIPT', str(ROOT / 'shrinx.py')), '--config', str(config_path.resolve()), 'run'], ProcessType='Background', LowPriorityIO=True, Nice=10, StandardOutPath=str(logs / 'service.log'), StandardErrorPath=str(logs / 'error.log'), EnvironmentVariables={'PATH': '/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin'})
     if cfg.get('daily_at') is not None:
         hour, minute = map(int, cfg['daily_at'].split(':'))
         payload['StartCalendarInterval'] = {'Hour': hour, 'Minute': minute}
@@ -771,7 +772,8 @@ def agent(cfg, config_path, action):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--config', type=Path, default=ROOT / 'config.json')
+    parser.add_argument('--version', action='version', version='%(prog)s ' + VERSION)
+    parser.add_argument('--config', type=Path, default=Path(os.environ.get('SHRINX_CONFIG', str(ROOT / 'config.json'))).expanduser())
     parser.add_argument('action', choices=['run', 'install', 'uninstall'], nargs='?', default='run')
     parser.add_argument('--dry-run', action='store_true')
     args = parser.parse_args()

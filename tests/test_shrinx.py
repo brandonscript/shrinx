@@ -1,4 +1,6 @@
 import json
+import os
+import plistlib
 import base64
 from pathlib import Path
 import shutil
@@ -539,6 +541,31 @@ class ConversionTests(unittest.TestCase):
         other = chunk(b'tEXt', b'Description\0Keep this')
         self.path.write_bytes(self.original[:33] + icc + other + self.original[33:])
         self.assertEqual(shrinx.convert(self.path, self.cfg, self.encoder), 'skipped')
+
+    def test_environment_config_and_explicit_override(self):
+        config = self.path.parent / 'environment.json'
+        config.write_text(json.dumps(self.cfg))
+        other = self.path.parent / 'explicit.json'
+        other.write_text(json.dumps(self.cfg))
+        with patch.dict(os.environ, {'SHRINX_CONFIG': str(config)}):
+            with patch('sys.argv', ['shrinx', 'run']), patch('shrinx.run', return_value=0) as run:
+                self.assertEqual(shrinx.main(), 0)
+                self.assertEqual(run.call_args.args[1], config)
+            with patch('sys.argv', ['shrinx', '--config', str(other), 'run']), patch('shrinx.run', return_value=0) as run:
+                self.assertEqual(shrinx.main(), 0)
+                self.assertEqual(run.call_args.args[1], other)
+
+    def test_packaged_schedule_uses_stable_paths(self):
+        home = self.path.parent
+        config = home / 'config.json'
+        with patch('shrinx.Path.home', return_value=home), patch('shrinx.subprocess.run'), patch.dict(os.environ, {
+                'SHRINX_SCRIPT': '/opt/example/opt/shrinx/libexec/shrinx.py',
+                'SHRINX_PYTHON': '/opt/example/opt/python/bin/python3'}):
+            shrinx.agent(self.cfg, config, 'install')
+        agent = plistlib.loads((home / 'Library/LaunchAgents/dev.shrinx.screenshots.plist').read_bytes())
+        self.assertEqual(agent['ProgramArguments'][:2], ['/opt/example/opt/python/bin/python3', '/opt/example/opt/shrinx/libexec/shrinx.py'])
+        self.assertEqual(agent['StartCalendarInterval'], {'Hour': 1, 'Minute': 0})
+        self.assertNotIn('RunAtLoad', agent)
 
     def test_failure_retains_original(self):
         with self.assertRaises(subprocess.CalledProcessError):

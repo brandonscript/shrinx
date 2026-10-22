@@ -2,30 +2,56 @@
 
 A small macOS service that converts images to smaller WebP files on a schedule. It writes each WebP beside its original, never overwrites an existing WebP, and keeps originals by default. Optional cleanup sends verified originals to Trash.
 
-## Get started
+## Install with Homebrew
 
-Requires macOS, Python 3.10+, and Google's WebP tools:
+Requires macOS. The formula installs Python, WebP tools, and ExifTool:
 
 ```sh
-brew install webp
+brew tap brandonscript/tap
+brew install brandonscript/tap/shrinx
+mkdir -p ~/.config/shrinx
+cp "$(brew --prefix shrinx)/share/shrinx/config.example.json" ~/.config/shrinx/config.json
+```
+
+Copy the example only on first setup; do not overwrite an existing personal configuration. Edit `~/.config/shrinx/config.json` to choose folders and settings, then preview and run:
+
+```sh
+shrinx --version
+shrinx run --dry-run
+shrinx run
+shrinx install
+```
+
+`shrinx install` enables the configured schedule (daily at 1 am by default). Package installation and upgrades do not start conversion or register a schedule. Use Shrinx's scheduler, not `brew services`. Its Homebrew paths remain stable across package upgrades; personal settings live outside the Cellar.
+
+```sh
+brew upgrade brandonscript/tap/shrinx
+shrinx uninstall
+brew uninstall shrinx
+```
+
+Run `shrinx uninstall` before removing the package to unregister its schedule. Configuration, logs, reports, and images are retained. Running `shrinx install` replaces the existing Shrinx user schedule, including one installed from a source checkout.
+
+Override the Homebrew config path with `--config` (highest priority) or `SHRINX_CONFIG`:
+
+```sh
+shrinx --config /path/to/settings.json run
+```
+
+## Run from source
+
+Requires Python 3.10+ and Google's WebP tools. Install [ExifTool](https://exiftool.org/) for metadata transfers and optional IPTC mapping:
+
+```sh
+brew install webp exiftool
 cp config.example.json config.json
 python3 shrinx.py run --dry-run
 python3 shrinx.py run
 ```
 
-Install [ExifTool](https://exiftool.org/) for resolution transfers and optional IPTC mapping:
+The source checkout defaults to its local `config.json`, which is ignored by Git; share [config.example.json](config.example.json) instead. Homebrew's `shrinx` command supports the same arguments as `python3 shrinx.py` in the examples below.
 
-```sh
-brew install exiftool
-```
-
-Edit `config.json` to choose folders and settings. It is ignored by Git; share [config.example.json](config.example.json) instead. Paths support `~` and spaces. Missing folders are skipped, subfolders are excluded unless `recursive` is true, and files younger than `minimum_age_seconds` (default 60) wait until a later run.
-
-Use a separate configuration with:
-
-```sh
-python3 shrinx.py --config /path/to/settings.json run
-```
+Paths support `~` and spaces. Missing folders are skipped, subfolders are excluded unless `recursive` is true, and files younger than `minimum_age_seconds` (default 60) wait until a later run. Set `recursive: true` to include subfolders; the same per-type settings, metadata checks, and Trash policy apply at every level.
 
 ## File types and compression
 
