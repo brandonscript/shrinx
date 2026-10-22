@@ -1,0 +1,17 @@
+{
+  "folders": [
+    "~/Desktop/Screenshots",
+    "~/Pictures/Screenshots",
+    "~/Documents/Screenshots"
+  ],
+  "mode": "auto",
+  "quality": 95,
+  "only_if_smaller": true,
+  "recursive": false,
+  "minimum_age_seconds": 60,
+  "interval_seconds": 900,
+  "cwebp": "cwebp",
+  "daily_at": "01:00",
+  "trash_originals": false,
+  "reports_directory": "~/Library/Logs/Shrinx/reports"
+}

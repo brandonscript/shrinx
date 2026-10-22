@@ -1,0 +1,28 @@
+# Local configuration and secrets
+config.json
+config.local.json
+.env
+.env.*
+!.env.example
+
+# Local runs, image fixtures, and logs
+test-runs/
+reports/
+.report-*
+*.log
+.shrinx-*/
+
+# Python and editor caches
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.coverage
+htmlcov/
+.idea/
+.vscode/
+
+# macOS
+.DS_Store
+._*
