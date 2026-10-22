@@ -13,5 +13,26 @@
   "cwebp": "cwebp",
   "daily_at": "01:00",
   "trash_originals": false,
-  "reports_directory": "~/Library/Logs/Shrinx/reports"
+  "reports_directory": "~/Library/Logs/Shrinx/reports",
+  "file_types": {
+    "png": {
+      "enabled": true,
+      "mode": "lossy",
+      "quality": 95
+    },
+    "jpeg": {
+      "enabled": true,
+      "mode": "lossy",
+      "quality": 80
+    },
+    "tiff": {
+      "enabled": true,
+      "mode": "lossless"
+    },
+    "bmp": {
+      "enabled": false,
+      "mode": "lossless"
+    }
+  },
+  "metadata_policy": "skip"
 }
