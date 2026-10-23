@@ -19,11 +19,12 @@ import tempfile
 import time
 import zlib
 import re
+from scheduling import serve, schedule_once, dispatch_once
 from png_colors import color_plan, prepare_png, has_embedded_icc
 from metadata import IPTC_MAP, BOILERPLATE, photoshop_resources, map_iptc
 
 ROOT = Path(__file__).resolve().parent
-VERSION = '0.1.0'
+VERSION = '0.1.1'
 LABEL = 'dev.shrinx.screenshots'
 LOG = logging.getLogger('shrinx')
 JPEG_EXTENSIONS = {'.jpg', '.jpeg', '.jpe', '.jfif', '.jif', '.jfi'}
@@ -699,7 +700,7 @@ def write_report(directory, started, counts, metrics, scanned, folder_errors, dr
     return report
 
 
-def run(cfg, config_path, dry_run):
+def run(cfg, config_path, dry_run, busy_exit_code=0):
     encoder = shutil.which(cfg.get('cwebp', 'cwebp'))
     if not encoder:
         raise ValueError('cwebp not found. Install with: brew install webp')
@@ -710,7 +711,7 @@ def run(cfg, config_path, dry_run):
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             LOG.info('Another run is active')
-            return 0
+            return busy_exit_code
         started = datetime.now(timezone.utc)
         reports = Path(cfg.get('reports_directory', '~/Library/Logs/Shrinx/reports')).expanduser()
         if not reports.is_absolute():
@@ -774,11 +775,27 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--version', action='version', version='%(prog)s ' + VERSION)
     parser.add_argument('--config', type=Path, default=Path(os.environ.get('SHRINX_CONFIG', str(ROOT / 'config.json'))).expanduser())
-    parser.add_argument('action', choices=['run', 'install', 'uninstall'], nargs='?', default='run')
+    parser.add_argument('action', choices=['run', 'service', 'schedule-once', 'install', 'uninstall'], nargs='?', default='run')
     parser.add_argument('--dry-run', action='store_true')
+    parser.add_argument('--once', action='store_true', help='Run service work once immediately')
+    parser.add_argument('--at', help='Future ISO date/time for schedule-once (local time if no offset)')
+    parser.add_argument('--dispatch-once', type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
     try:
+        runner = lambda cfg, path, dry: run(cfg, path, dry, busy_exit_code=75)
+        if args.dispatch_once:
+            return dispatch_once(args.dispatch_once, load_config, runner)
+        if args.action == 'service':
+            return serve(args.config, load_config, runner, args.dry_run, args.once)
+        if args.action == 'schedule-once':
+            load_config(args.config)
+            if not args.at:
+                raise ValueError('schedule-once requires --at')
+            command = [os.environ.get('SHRINX_PYTHON', sys.executable), os.environ.get('SHRINX_SCRIPT', str(ROOT / 'shrinx.py'))]
+            identifier = schedule_once(args.config, args.at, command, args.dry_run)
+            print(identifier)
+            return 0
         if args.action == 'uninstall':
             agent({}, args.config, args.action)
             return 0
@@ -786,6 +803,8 @@ def main():
         if args.action == 'run':
             return run(cfg, args.config, args.dry_run)
         agent(cfg, args.config, args.action)
+        return 0
+    except KeyboardInterrupt:
         return 0
     except (ValueError, zlib.error, OSError, subprocess.SubprocessError) as e:
         LOG.error('%s', e)
